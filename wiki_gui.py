@@ -7,52 +7,56 @@ import os
 import threading
 import tkinter as tk
 from tkinter import messagebox
-import re  # 正则库
+import re
 
-# 初始化繁体→简体转换
+# 繁体→简体转换器
 cc = OpenCC('t2s')
 
-# 正则：参考文献标题检测
+# 正则模式
 REF_HEADING_RE = re.compile(r'^#{1,6}\s*(参考文献|References)', re.IGNORECASE)
-# 正则：脚注引用[[1]](#cite_note-1)
-CITE_RE = re.compile(r"\[\[(\d+)\]\]\(#cite_note-\d+\)")
+# 匹配脚注引用，如 [[7]](#cite_note-...)
+CITE_RE = re.compile(r"\[\[(\d+)\]\]\(#cite_note-[^)]+\)")
+# 匹配普通外部链接
+LINK_RE = re.compile(r"\[([^\]]+)\]\((?!#)[^)]+\)")
+# 匹配内部锚点链接（#开头）
+ANCHOR_RE = re.compile(r"\[([^\]]+)\]\(#[^)]+\)")
 
-def fetch_by_title(title, lang, output_dir='output'):
+
+def fetch_content(source: str, by_title: bool, lang: str):
+    """按词条或URL获取页面标题和HTML内容"""
     wikipedia.set_lang(lang)
-    page = wikipedia.page(title)
-    return page.title, page.html()
-
-def fetch_by_url(url):
-    # 只支持 Wikipedia 页面
-    resp = requests.get(url)
+    if by_title:
+        page = wikipedia.page(source)
+        return page.title, page.html()
+    resp = requests.get(source)
     resp.raise_for_status()
-    page = BeautifulSoup(resp.text, 'html.parser')
-    title = page.find(id='firstHeading').get_text()
-    content_div = page.find('div', id='mw-content-text')
-    return title, str(content_div)
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    title = soup.find(id='firstHeading').get_text()
+    html = str(soup.find('div', id='mw-content-text'))
+    return title, html
 
-def process_html(title, html_content, lang, output_dir='output'):
-    # 清理编辑按钮
-    soup = BeautifulSoup(html_content, 'html.parser')
-    for span in soup.find_all('span', class_='mw-editsection'):
+
+def process_html(title: str, html: str, lang: str, output_dir: str = 'output') -> str:
+    """
+    清理HTML，下载并重命名图片，转换为Markdown，处理链接与脚注
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    for span in soup.select('.mw-editsection'):
         span.decompose()
 
-    # 图片本地化
+    # 下载并本地化图片
     img_dir = os.path.join(output_dir, 'images')
     os.makedirs(img_dir, exist_ok=True)
-    for img in soup.find_all('img'):
+    for idx, img in enumerate(soup.find_all('img'), start=1):
         src = img.get('src') or img.get('data-src')
         if not src:
             continue
-        if src.startswith('//'):
-            url = 'https:' + src
-        elif src.startswith('/'):
-            domain = f'https://{lang}.wikipedia.org'
-            url = domain + src
-        else:
-            url = src
-        fname = os.path.basename(url.split('?')[0])
-        local_rel = os.path.join('images', fname)
+        url = src if src.startswith('http') else (
+            'https:' + src if src.startswith('//') else f'https://{lang}.wikipedia.org' + src
+        )
+        ext = os.path.splitext(url.split('?')[0])[1]
+        new_name = f"{title.replace('/', '_')}_{idx}{ext}"
+        local_rel = os.path.join('images', new_name)
         full_path = os.path.join(output_dir, local_rel)
         try:
             r = requests.get(url, timeout=10)
@@ -60,110 +64,111 @@ def process_html(title, html_content, lang, output_dir='output'):
             with open(full_path, 'wb') as f:
                 f.write(r.content)
             img['src'] = local_rel
-        except:
+        except Exception:
             continue
 
-    # 转 Markdown
-    md_text = md(str(soup))
-    # 繁转简
+    # 转为Markdown并简体化
+    text = md(str(soup))
     if lang == 'zh':
-        md_text = cc.convert(md_text)
+        text = cc.convert(text)
 
-    # 拆分参考文献区
-    lines = md_text.splitlines()
-    idx_ref = len(lines)
-    for i, l in enumerate(lines):
-        if REF_HEADING_RE.match(l):
-            idx_ref = i
+    # 分离正文与参考文献
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if REF_HEADING_RE.match(line):
+            main, ref = '\n'.join(lines[:i]), '\n'.join(lines[i:])
             break
-    main = '\n'.join(lines[:idx_ref])
-    ref = '\n'.join(lines[idx_ref:])
+    else:
+        main, ref = text, ''
 
-    # 主体链接处理
-    # 媒体链接
-    main = re.sub(r"\[([^\]]+)\]\(//upload\.wikimedia\.org[^)]+\)", r"\1", main)
-    # 内部 Wiki 链接转 [[text]]
-    main = re.sub(r"\[([^\]]+)\]\(/wiki/[^)]+(?: \"[^\"]*\")?\)", r"[[\1]]", main)
-    # 去除其他链接（非 # 开头的链接），替换为粗体文本；保留锚点链接如 [1 标题](#标题)
-    main = re.sub(r"\[([^\]]+)\]\((?!#)[^)]+\)", r"**\1**", main)
-    # 脚注引用[[1]](#cite_note-1) 转为 $^1$
-    main = CITE_RE.sub(lambda m: f"${{^{m.group(1)}}}$" , main)
+    # 去除红链及“页面不存在”提示
+    main = re.sub(r"\[([^\]]+)\]\([^)]*redlink=1[^)]*\)", '', main)
+    main = re.sub(r"&action=edit&redlink=1[^\s]*", '', main)
+    main = re.sub(r"（页面不存在）", '', main)
 
-    # 参考文献：去除 redlink
+    # 图片链接转换为 ![[词条_序号]]
+    main = re.sub(
+        r"!\[([^\]]+?)\]\(images/([^\)]+?)\)",
+        lambda m: f"![[{title.replace('/', '_')}_{m.group(2).split('_')[-1].split('.')[0]}]]",
+        main
+    )
+    # 脚注引用转换，如 [[7]](...) -> $^{7}$
+    main = CITE_RE.sub(lambda m: f"$^{{{m.group(1)}}}$", main)
+    # 移除所有内部锚点链接，转换为加粗文本
+    main = ANCHOR_RE.sub(lambda m: f"**{m.group(1)}**", main)
+    # 外部链接转换为加粗文本
+    main = LINK_RE.sub(lambda m: f"**{m.group(1)}**", main)
+
+    # 参考文献区块处理
     if ref:
         ref = re.sub(r"\[([^\]]+)\]\([^)]*redlink=1[^)]*\)", '', ref)
-        # 脚注引用在参考文献段也转换
-        ref = CITE_RE.sub(lambda m: f"${{^{m.group(1)}}}$", ref)
+        ref = CITE_RE.sub(lambda m: f"$^{{{m.group(1)}}}$", ref)
+        ref = ANCHOR_RE.sub(lambda m: f"**{m.group(1)}**", ref)
+        ref = LINK_RE.sub(lambda m: f"**{m.group(1)}**", ref)
 
-    # 写文件
-    safe = title.replace('/', '_')
+    # 写入Markdown文件
+    safe_title = title.replace('/', '_')
     os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, f"{safe}.md")
+    path = os.path.join(output_dir, f"{safe_title}.md")
     with open(path, 'w', encoding='utf-8') as f:
-        f.write(f"# {title}\n\n")
-        f.write(main + ('\n' + ref if ref else ''))
+        f.write(f"# {title}\n\n{main}\n{ref}")
     return path
 
+
+def run_export(entry: str, mode: str, lang: str):
+    """
+    启动导出流程
+    """
+    by_title = (mode == 'title')
+    title, html = fetch_content(entry, by_title, lang)
+    return process_html(title, html, lang)
+
+
 def on_fetch():
-    mode = var_mode.get()
-    lang = var_lang.get()
-    entry_text = entry.get().strip()
-    if not entry_text:
-        messagebox.showwarning("输入错误", "请填写词条或URL。")
+    """GUI 触发：读取输入并启动后台任务"""
+    entry = entry_input.get().strip()
+    if not entry:
+        messagebox.showwarning('输入错误', '请填写词条或URL。')
         return
     btn_fetch.config(state='disabled')
-    lbl_status.config(text="⏳ 处理中…")
+    status_label.config(text='⏳ 处理中…')
 
     def task():
         try:
-            if mode == 'title':
-                title, html = fetch_by_title(entry_text, lang)
-            else:
-                title, html = fetch_by_url(entry_text)
-            out = process_html(title, html, lang)
-            msg = f"✅ 成功：{out}"
+            out = run_export(entry, mode_var.get(), lang_var.get())
+            status = f'✅ 成功：{out}'
         except Exception as e:
-            msg = f"❌ 错误：{e}"
-        lbl_status.config(text=msg)
+            status = f'❌ 错误：{e}'
+        status_label.config(text=status)
         btn_fetch.config(state='normal')
 
     threading.Thread(target=task, daemon=True).start()
 
-# GUI
+# GUI 界面初始化
 root = tk.Tk()
-root.title("维基导出工具")
-root.geometry("500x260")
+root.title('维基导出工具')
+root.geometry('500x260')
 root.resizable(False, False)
 
 frame = tk.Frame(root, padx=15, pady=15)
 frame.pack(fill=tk.BOTH, expand=True)
 
-# 模式选择
-var_mode = tk.StringVar(value='title')
-mode_title = tk.Radiobutton(frame, text='按词条搜索', variable=var_mode, value='title')
-mode_url = tk.Radiobutton(frame, text='按页面URL', variable=var_mode, value='url')
-mode_title.grid(row=0, column=0, sticky='w')
-mode_url.grid(row=0, column=1, sticky='w')
+mode_var = tk.StringVar(value='title')
+tk.Radiobutton(frame, text='按词条搜索', variable=mode_var, value='title').grid(row=0, column=0, sticky='w')
+tk.Radiobutton(frame, text='按页面URL', variable=mode_var, value='url').grid(row=0, column=1, sticky='w')
 
-# 输入
 tk.Label(frame, text='词条或URL：').grid(row=1, column=0, pady=8, sticky='e')
-entry = tk.Entry(frame, width=40)
-entry.grid(row=1, column=1, columnspan=2, pady=8)
+entry_input = tk.Entry(frame, width=40)
+entry_input.grid(row=1, column=1, columnspan=2, pady=8)
 
-# 语言
-var_lang = tk.StringVar(value='zh')
+lang_var = tk.StringVar(value='zh')
 tk.Label(frame, text='语言：').grid(row=2, column=0, sticky='e')
-lang_ch = tk.Radiobutton(frame, text='中文', variable=var_lang, value='zh')
-lang_en = tk.Radiobutton(frame, text='English', variable=var_lang, value='en')
-lang_ch.grid(row=2, column=1)
-lang_en.grid(row=2, column=2)
+tk.Radiobutton(frame, text='中文', variable=lang_var, value='zh').grid(row=2, column=1)
+tk.Radiobutton(frame, text='English', variable=lang_var, value='en').grid(row=2, column=2)
 
-# 抓取按钮
 btn_fetch = tk.Button(frame, text='开始导出', width=12, command=on_fetch)
 btn_fetch.grid(row=3, column=1, pady=15)
-
-# 状态
-lbl_status = tk.Label(frame, text='', wraplength=460, justify='left')
-lbl_status.grid(row=4, column=0, columnspan=3)
+status_label = tk.Label(frame, text='', wraplength=460, justify='left')
+status_label.grid(row=4, column=0, columnspan=3)
 
 root.mainloop()
