@@ -11,7 +11,7 @@
 5. 排除多余的媒体文件链接，保留纯文本。
 6. 对所有其他外部链接，替换为 **粗体文本**。
 7. 将脚注格式 `[[1]](#cite_note-1)` 转换为 `$^1$`。
-8. 保留目录中的内部锚点链接（例如 `[1 历史发展](#历史发展)`）。
+8. 移除目录中的内部锚点链接，改为粗体文字（例如 `[1 历史发展](#历史发展)` → `**1 历史发展**`）。
 9. 自动下载页面中所有图片，保存在 `output/images/` 目录，并在 Markdown 中使用相对路径引用。
 
 ## 环境与依赖
@@ -59,9 +59,15 @@ python -m pip install wikipedia markdownify opencc-python-reimplemented beautifu
 * **长页面**：对于大页面，转换过程可能稍慢，请耐心等待。
 * **脚注与参考文献**：仅对可识别的脚注做转换，复杂引用样式可能需人工调整。
 
+## 测试 / Tests
+
+本项目附带 `tests/test_process_html.py`，使用 **pytest** 验证内部锚点会被转换为粗体文字并且脚注格式为 `$^1$`。
+
+The repository includes `tests/test_process_html.py`. Run **pytest** to check that internal anchor links become bold text and footnotes render as `$^1$`.
+
 ## 制作者
 
-* **脚本撰写**：ChatGPT （OpenAI o4-mini）
+* **脚本撰写**：ChatGPT （OpenAI GPT-4 mini）
 * **需求及优化**：vyen
 
 ---
