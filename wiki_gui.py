@@ -133,14 +133,18 @@ def on_fetch():
     btn_fetch.config(state='disabled')
     status_label.config(text='⏳ 处理中…')
 
+    def update_status(status: str):
+        """在主线程更新GUI状态"""
+        status_label.config(text=status)
+        btn_fetch.config(state='normal')
+
     def task():
         try:
             out = run_export(entry, mode_var.get(), lang_var.get())
             status = f'✅ 成功：{out}'
         except Exception as e:
             status = f'❌ 错误：{e}'
-        status_label.config(text=status)
-        btn_fetch.config(state='normal')
+        root.after(0, lambda: update_status(status))
 
     threading.Thread(target=task, daemon=True).start()
 
